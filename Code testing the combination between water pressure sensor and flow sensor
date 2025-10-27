@@ -1,0 +1,77 @@
+#include <LiquidCrystal.h>
+
+// ===== LCD Setup =====
+// RS, EN, D4, D5, D6, D7
+LiquidCrystal lcd(12, 11, 6, 5, 4, 3);
+
+// ===== Flow Sensor Variables =====
+volatile int FlowPulse = 0;
+const int flowSensorPin = 2;   // Signal pin (must be interrupt-capable)
+float flowRate = 0;            // Flow rate in L/h
+
+// ===== Pressure Sensor Variables =====
+const int pressurePin = A0;    // Analog pin for pressure sensor
+float voltage = 0;
+float pressureBar = 0;
+
+// ===== Pressure Sensor Calibration (adjust for your sensor) =====
+// Example: 0.5V = 0 bar, 4.5V = 10 bar range
+const float SENSOR_MIN_V = 0.5;
+const float SENSOR_MAX_V = 4.5;
+const float SENSOR_MAX_BAR = 10.0;
+
+void setup() {
+  // --- Flow Sensor Setup ---
+  pinMode(flowSensorPin, INPUT);
+  attachInterrupt(digitalPinToInterrupt(flowSensorPin), countFlowPulse, RISING);
+
+  // --- LCD Setup ---
+  lcd.begin(16, 2);
+  lcd.clear();
+  lcd.print("Flow & Pressure");
+  delay(1500);
+  lcd.clear();
+}
+
+void loop() {
+  // ===== FLOW MEASUREMENT =====
+  FlowPulse = 0;
+  sei();           // Enable interrupts
+  delay(1000);     // 1 second sampling window
+  cli();           // Disable interrupts while calculating
+
+  flowRate = (FlowPulse * 60.0) / 7.5; // (pulses/sec * 60) / 7.5 = L/hour
+
+  // ===== PRESSURE MEASUREMENT =====
+  long sum = 0;
+  for (int i = 0; i < 256; i++) {
+    sum += analogRead(pressurePin);
+  }
+
+  float avgReading = sum / 256.0;
+  voltage = (avgReading / 1023.0) * 5.0;
+
+  // Convert voltage to pressure (bar)
+  if (voltage < SENSOR_MIN_V) voltage = SENSOR_MIN_V;
+  if (voltage > SENSOR_MAX_V) voltage = SENSOR_MAX_V;
+  pressureBar = (voltage - SENSOR_MIN_V) * (SENSOR_MAX_BAR / (SENSOR_MAX_V - SENSOR_MIN_V));
+
+  // ===== DISPLAY ON LCD =====
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Flow:");
+  lcd.print(flowRate, 1);
+  lcd.print(" L/h");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Press:");
+  lcd.print(pressureBar, 2);
+  lcd.print(" bar");
+
+  delay(500); // update display every half-second
+}
+
+// ===== Interrupt Service Routine =====
+void countFlowPulse() {
+  FlowPulse++;
+}
