@@ -1,0 +1,186 @@
+// UNO R4 WiFi (WiFiS3) + ADXL335 movement tracker + TCP stream
+// A0 = X, A1 = Y, A2 = Z
+#include <Arduino.h>
+#include <WiFiS3.h>
+#include <math.h>
+
+// ---------- WiFi ----------
+const char* SSID = "SSID";          //CHANGE THESE
+const char* PASS = "PASSWORD";      //CHANGE THESE
+WiFiServer server(8080);
+WiFiClient client;
+
+// ---------- ADXL335 ----------
+const int PIN_X = A0, PIN_Y = A1, PIN_Z = A2;
+
+const float AREF_V = 5.0;
+const float SENS_V_PER_G = 0.300;                        // 300 mV/g
+const float COUNTS_PER_V = 1023.0 / AREF_V;              // counts per volt
+const float COUNTS_PER_G = SENS_V_PER_G * COUNTS_PER_V;  // ~61 counts/g @5V
+
+const float MOVE_THRESHOLD = 0.1f;                       // ignore small values
+
+// timing
+const unsigned SAMPLE_HZ = 50;
+const unsigned long SAMPLE_MS = 1000UL / SAMPLE_HZ;
+const unsigned long PRINT_MS  = 500;                     // print/stream every 0.5s
+
+// offsets + state
+int x_off=0, y_off=0, z_off=0;
+bool havePrev = false;
+float prevXg=0, prevYg=0, prevZg=0;
+
+// totals
+double totalAbsX=0, totalAbsY=0, totalAbsZ=0;
+double totalAbsL1=0, totalAbsL2=0;
+double feet=0;
+
+// last raw sample (for printing)
+int   last_xr=0, last_yr=0, last_zr=0;  // ADC counts
+float last_xv=0, last_yv=0, last_zv=0;  // volts
+
+// timers
+unsigned long tSample=0, tPrint=0;
+
+int readAvg(int pin, int n=16){
+  long acc=0;
+  for(int i=0;i<n;i++) acc += analogRead(pin);
+  return acc / n;
+}
+
+void resetTotals(){
+  totalAbsX = totalAbsY = totalAbsZ = totalAbsL1 = totalAbsL2 = 0;
+  feet = 0;
+  havePrev = false;
+}
+
+void printRaw(Stream& s){
+  s.print("RAW  ADC  X:"); s.print(last_xr);
+  s.print("  Y:");        s.print(last_yr);
+  s.print("  Z:");        s.println(last_zr);
+}
+
+void printLine(Stream& s){
+  s.print("Totals |Δg|  X: "); s.print(totalAbsX,3);
+  s.print("  Y: ");           s.print(totalAbsY,3);
+  s.print("  Z: ");           s.print(totalAbsZ,3);
+  s.print("  | L1: ");        s.print(totalAbsL1,3);
+  s.print("  L2: ");          s.print(totalAbsL2,3);
+  s.print("  | Feet: ");      s.println(feet,3);
+}
+
+void setup(){
+  Serial.begin(115200);
+  delay(400);
+
+  // --- Calibrate offsets while flat & still ---
+  x_off = readAvg(PIN_X);
+  y_off = readAvg(PIN_Y);
+  z_off = readAvg(PIN_Z);
+
+  Serial.println("ADXL335 movement tracker with 0.1g deadband");
+  Serial.print("Offsets  X0="); Serial.print(x_off);
+  Serial.print("  Y0=");       Serial.print(y_off);
+  Serial.print("  Z0=");       Serial.println(z_off);
+  Serial.println("Press 'r' to reset totals\n");
+
+  // --- WiFi connect ---
+  Serial.print("Connecting to "); Serial.print(SSID);
+  WiFi.begin(SSID, PASS);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(250);
+    Serial.print('.');
+    if (millis() - t0 > 15000) break; 
+  }
+  //DELAY TO PREVENT 0.0.0.0
+  delay(2000);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    IPAddress ip = WiFi.localIP();
+    Serial.print("\nWiFi connected. IP: "); Serial.println(ip);
+    server.begin();
+    Serial.println("TCP stream on port 8080");
+    Serial.println("Use:  nc <IP> 8080   or   PuTTY → Raw @ 8080");
+  } else {
+    Serial.println("\n[WiFi not connected] — streaming only over Serial.");
+  }
+
+  tSample = tPrint = millis();
+}
+
+//CONNECTING VIA HOTSPOT
+void loop(){
+  // Accept client if not connected
+  if (!client || !client.connected()) {
+    WiFiClient newClient = server.available();
+    if (newClient) {
+      client.stop();           // drop previous
+      client = newClient;
+      client.println("Connected to UNO R4 WiFi ADXL335 stream");
+    }
+  }
+
+  // Serial command
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c=='r' || c=='R') {
+      resetTotals();
+      Serial.println("[reset]");
+      if (client && client.connected()) client.println("[reset]");
+    }
+  }
+
+  unsigned long now = millis();
+
+  // ---- sample at fixed rate ----
+  if (now - tSample >= SAMPLE_MS) {
+    tSample += SAMPLE_MS;
+
+    int xr = readAvg(PIN_X);
+    int yr = readAvg(PIN_Y);
+    int zr = readAvg(PIN_Z);
+
+    last_xr = xr; last_yr = yr; last_zr = zr;
+    last_xv = xr / COUNTS_PER_V;   // volts = counts / (counts/volt)
+    last_yv = yr / COUNTS_PER_V;
+    last_zv = zr / COUNTS_PER_V;
+
+    float xg = (xr - x_off) / COUNTS_PER_G;
+    float yg = (yr - y_off) / COUNTS_PER_G;
+    float zg = (zr - z_off) / COUNTS_PER_G;
+
+    if (!havePrev) {
+      prevXg=xg; prevYg=yg; prevZg=zg;
+      havePrev = true;
+    } else {
+      float dx = xg - prevXg;
+      float dy = yg - prevYg;
+      float dz = zg - prevZg;
+
+      if (fabs(dx) < MOVE_THRESHOLD) dx = 0;
+      if (fabs(dy) < MOVE_THRESHOLD) dy = 0;
+      if (fabs(dz) < MOVE_THRESHOLD) dz = 0;
+
+      totalAbsX += fabs(dx);
+      totalAbsY += fabs(dy);
+      totalAbsZ += fabs(dz);
+
+      totalAbsL1 += fabs(dx) + fabs(dy) + fabs(dz);
+      totalAbsL2 += sqrtf(dx*dx + dy*dy + dz*dz);         //USING THIS ONE -> MAGNITUDE   
+
+      prevXg = xg; prevYg = yg; prevZg = zg;
+    }
+
+    feet = totalAbsL2 / 1.1;  // tune 
+
+  if (now - tPrint >= PRINT_MS) {
+    tPrint += PRINT_MS;
+
+    printRaw(Serial);
+    if (client && client.connected()) printRaw(client);
+
+    printLine(Serial);
+    if (client && client.connected()) printLine(client);
+  }
+}
