@@ -23,7 +23,7 @@ const float MOVE_THRESHOLD = 0.1f;                       // ignore small values
 // timing
 const unsigned SAMPLE_HZ = 50;
 const unsigned long SAMPLE_MS = 1000UL / SAMPLE_HZ;
-const unsigned long PRINT_MS  = 500;                     // print/stream every 0.5s
+const unsigned long PRINT_MS  = 500;                     
 
 // offsets + state
 int x_off=0, y_off=0, z_off=0;
